@@ -1,9 +1,10 @@
 """
 Interactive Tkinter/matplotlib tool for exploring CCD and Q-Q diagrams with a
-choice of filters on every axis, and an Ellipse toolbar to draw/select/delete
-elliptical selection regions on either panel with the mouse. Ellipses (not
-circles) because the two axes of a panel are frequently on very different
-scales, so a fixed-radius circle would look distorted relative to the data.
+choice of filters on every axis, and a Region toolbar to draw/select/delete
+elliptical or box-shaped selection regions on either panel with the mouse.
+Ellipses (not circles) because the two axes of a panel are frequently on very
+different scales, so a fixed-radius circle would look distorted relative to
+the data.
 
 Left panel (CCD): a plain 2-filter color-color diagram, x = mag[X1]-mag[X2],
 y = mag[Y1]-mag[Y2] - pick any 4 filters from the dropdowns.
@@ -21,15 +22,29 @@ or Ha, come from different filter codes depending on the galaxy). Every
 band's magnitudes/S-N are loaded once at startup, so switching filters in the
 dropdowns is instant (no re-reading the catalogs).
 
-Ellipse toolbar (applies to whichever panel you interact with next):
+Region toolbar (applies to whichever panel you interact with next):
+  - Ellipse / Box radio buttons: pick the shape "Add new" draws. An ellipse
+    is dragged from its center out to its edge; a box from one corner to
+    the opposite corner.
   - "Add new": arms drawing mode - drag on either panel to draw a new
-    ellipse (color auto-assigned); stays armed for drawing more until you
-    press "Select".
-  - "Select": arms selection mode - click inside an ellipse to select it
+    region (color auto-assigned); it becomes the selection immediately;
+    stays armed for drawing more until you press "Select".
+  - "Select": arms selection mode - click inside a region to select it
     (highlighted with a thicker edge).
-  - "Delete": removes the currently selected ellipse.
+  - "Delete": removes the currently selected region(s).
+  - "Delete all": removes every region on both panels.
   - "Unfocus": clears the current selection without deleting anything.
-Delete/Backspace on the keyboard also removes the selected ellipse.
+  - "Multi-select" checkbox: when off, selecting (or drawing) a region
+    replaces the selection; when on, drawing adds to it and clicking a
+    region toggles it, across both panels.
+Delete/Backspace on the keyboard also removes the selected regions; arrow
+keys and the Grow/Shrink buttons act on all selected regions.
+
+Bottom panel (SED): the individual SEDs (magnitude converted to flux,
+normalized to F814W) of every cluster inside the selected region, plus its
+median as a heavier line. With several regions selected only each region's
+median is drawn (in that region's color), so the curves stay readable.
+Updates whenever the selection, a region, or the filter dropdowns change.
 """
 
 import glob
@@ -39,6 +54,7 @@ import tkinter as tk
 from tkinter import ttk
 
 import extinction
+import matplotlib
 import numpy as np
 import pandas as pd
 from astropy.io import fits
@@ -48,7 +64,14 @@ from matplotlib.backends.backend_tkagg import (
     NavigationToolbar2Tk,
 )
 from matplotlib.figure import Figure
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Ellipse, Rectangle
+
+# Matplotlib's default keyboard shortcuts (arrow keys pan, Backspace goes
+# back, etc.) collide with this app's own arrow-key/Delete bindings for
+# moving and deleting regions, so turn them all off.
+for _keymap in list(matplotlib.rcParams):
+    if _keymap.startswith("keymap."):
+        matplotlib.rcParams[_keymap] = []
 
 MODELS_DIR = "/home/igerasimov/Nextcloud/science/phangs/DATA/modelsv5"
 CATALOG_GLOB = (
@@ -58,7 +81,7 @@ CATALOG_GLOB = (
 SN_MIN = 3.0
 R_V = 3.1
 
-ELLIPSE_COLORS = [
+REGION_COLORS = [
     "tab:red",
     "tab:blue",
     "tab:green",
@@ -71,12 +94,14 @@ ELLIPSE_COLORS = [
     "gold",
 ]
 DRAG_THRESHOLD_PX = (
-    4  # minimum press-release distance to count as a drawn ellipse
+    4  # minimum press-release distance to count as a drawn region
 )
-RESIZE_FACTOR = 1.2  # per-click growth/shrink factor for the selected ellipse
+RESIZE_FACTOR = 1.2  # per-click growth/shrink factor for the selected region
 MOVE_STEP_FRAC = (
     0.02  # arrow-key nudge, as a fraction of the panel's current axis range
 )
+SED_NORM_BAND = "I"  # F814W - normalize every SED to this band before averaging
+SED_MAX_LINES = 200  # cap individual SEDs drawn per region (perf)
 
 # How to refer to each filter: short band name -> the HST/JWST filter code(s)
 # it can be read from (in priority order - some bands are reported under
@@ -185,16 +210,16 @@ def q_index(mag, bands, k):
 
 
 class Panel:
-    """One axes' worth of state: its data, ellipses, and drag state."""
+    """One axes' worth of state: its data, regions, and drag state."""
 
     def __init__(self, ax):
         self.ax = ax
-        self.ellipses = []  # list of dicts: {center, rx, ry, color}
-        self.color_cycle = itertools.cycle(ELLIPSE_COLORS)
-        self.selected = None
+        self.regions = []  # list of dicts: {shape, center, rx, ry, color}
+        self.color_cycle = itertools.cycle(REGION_COLORS)
+        self.selected = []  # subset of self.regions (same dict objects)
         self.press_xy = None
         self.press_pixel = None
-        self.drag_ellipse = None
+        self.drag_region = None
         self.x = np.array([])
         self.y = np.array([])
         self.x_model = np.array([])
@@ -213,16 +238,36 @@ class App:
         self.models_mag, models_age = load_models(MODELS_DIR)
         self.log_age = np.log10(models_age)
         self.cat_mag, self.cat_sn = load_catalog(CATALOG_GLOB)
+        self._prepare_sed_arrays()
 
-        self.fig = Figure(figsize=(12, 5.5))
-        ax_ccd = self.fig.add_subplot(1, 2, 1)
-        ax_qq = self.fig.add_subplot(1, 2, 2)
+        self.fig = Figure(figsize=(12, 8.5))
+        gs = self.fig.add_gridspec(2, 2, height_ratios=[1, 0.7])
+        ax_ccd = self.fig.add_subplot(gs[0, 0])
+        ax_qq = self.fig.add_subplot(gs[0, 1])
+        self.sed_ax = self.fig.add_subplot(gs[1, :])
         self.panels = {"ccd": Panel(ax_ccd), "qq": Panel(ax_qq)}
 
         self._build_controls()
         self._build_canvas()
         self._connect_events()
         self.redraw_all()
+
+    def _prepare_sed_arrays(self):
+        """Per-cluster flux (relative to SED_NORM_BAND) and per-band validity, for the SED panel."""
+        norm_mag = self.cat_mag[SED_NORM_BAND]
+        norm_zp = FILTERS[SED_NORM_BAND]["zp_vega"]
+        self.sed_norm_valid = np.isfinite(norm_mag) & (
+            self.cat_sn[SED_NORM_BAND] >= SN_MIN
+        )
+        self.sed_band_valid = {
+            b: np.isfinite(self.cat_mag[b]) & (self.cat_sn[b] >= SN_MIN)
+            for b in BAND_NAMES
+        }
+        self.sed_flux_norm = {
+            b: (FILTERS[b]["zp_vega"] / norm_zp)
+            * 10 ** (-0.4 * (self.cat_mag[b] - norm_mag))
+            for b in BAND_NAMES
+        }
 
     # ---- UI construction --------------------------------------------------
 
@@ -309,9 +354,24 @@ class App:
             row=next(row), column=0, columnspan=2, sticky="ew", pady=8
         )
 
-        ttk.Label(frame, text="Ellipse", font=("", 10, "bold")).grid(
+        ttk.Label(frame, text="Region", font=("", 10, "bold")).grid(
             row=next(row), column=0, columnspan=2, sticky="w", pady=(0, 4)
         )
+        self.shape = tk.StringVar(value="box")
+        shape_row = ttk.Frame(frame)
+        shape_row.grid(row=next(row), column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(
+            shape_row, text="Ellipse", variable=self.shape, value="ellipse"
+        ).grid(row=0, column=0, padx=1)
+        ttk.Radiobutton(
+            shape_row, text="Box", variable=self.shape, value="box"
+        ).grid(row=0, column=1, padx=1)
+
+        self.multi = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame, text="Multi-select", variable=self.multi
+        ).grid(row=next(row), column=0, columnspan=2, sticky="w")
+
         self.mode = tk.StringVar(value="select")
         button_row = ttk.Frame(frame)
         button_row.grid(row=next(row), column=0, columnspan=2, sticky="w")
@@ -363,6 +423,12 @@ class App:
             width=9,
             command=lambda: self.resize_selected(fy=1 / RESIZE_FACTOR),
         ).grid(row=3, column=1, padx=1, pady=1)
+        ttk.Button(
+            button_row,
+            text="Delete all",
+            width=9,
+            command=self.delete_all,
+        ).grid(row=4, column=0, padx=1, pady=1)
 
         self.mode_label = tk.StringVar()
         ttk.Label(
@@ -373,7 +439,7 @@ class App:
 
         ttk.Label(
             frame,
-            text="Arrow keys move the selected ellipse.",
+            text="Arrow keys move the selected regions.",
             foreground="gray30",
             wraplength=180,
         ).grid(row=next(row), column=0, columnspan=2, sticky="w", pady=(4, 0))
@@ -405,10 +471,14 @@ class App:
             self.redraw_all()
 
     def _build_canvas(self):
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        canvas_frame = ttk.Frame(self.root)
+        canvas_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=canvas_frame)
         self.canvas.get_tk_widget().pack(
-            side=tk.RIGHT, fill=tk.BOTH, expand=True
+            side=tk.TOP, fill=tk.BOTH, expand=True
         )
+        self.toolbar = NavigationToolbar2Tk(self.canvas, canvas_frame)
+        self.toolbar.update()
         self.canvas.draw()
 
     def _connect_events(self):
@@ -495,6 +565,7 @@ class App:
         self.status.set("")
         for key in ("ccd", "qq"):
             self.redraw_panel(key)
+        self.redraw_sed()
         self.fig.tight_layout(pad=2.5)
         self.canvas.draw_idle()
 
@@ -505,7 +576,7 @@ class App:
         ax.clear()
         ax.scatter(panel.x, panel.y, s=3, c="gray", alpha=0.3, rasterized=True)
         cmd = self.ccd_cmd.get() if key == "ccd" else self.qq_cmd.get()
-        if cmd:
+        if cmd or key == "qq":
             # model magnitudes aren't scaled to a real cluster mass/distance,
             # so they aren't meaningfully comparable to observed magnitudes
             if panel.colorbar_obj is not None:
@@ -536,22 +607,23 @@ class App:
         if preserve_limits:
             ax.set_xlim(xlim)
             ax.set_ylim(ylim)
-        for e in panel.ellipses:
-            patch = Ellipse(
-                e["center"],
-                2 * e["rx"],
-                2 * e["ry"],
-                fill=False,
-                edgecolor=e["color"],
-                linewidth=2.5 if e is panel.selected else 1.4,
+        for e in panel.regions:
+            ax.add_patch(
+                self.make_patch(
+                    e["shape"],
+                    e["center"],
+                    e["rx"],
+                    e["ry"],
+                    e["color"],
+                    linewidth=2.5 if self.is_selected(panel, e) else 1.4,
+                )
             )
-            ax.add_patch(patch)
 
-        # clusters selected by the OTHER panel's ellipses, shown here too
+        # clusters selected by the OTHER panel's regions, shown here too
         other_key = self.other_key(key)
         other_panel = self.panels[other_key]
-        for e in other_panel.ellipses:
-            cross_mask = self.ellipse_full_mask(other_panel, e) & panel.mask
+        for e in other_panel.regions:
+            cross_mask = self.region_full_mask(other_panel, e) & panel.mask
             ax.scatter(
                 panel.x_all[cross_mask],
                 panel.y_all[cross_mask],
@@ -561,20 +633,103 @@ class App:
                 linewidths=1.2,
                 label=f"{other_key}-selected (N={cross_mask.sum()})",
             )
-        if other_panel.ellipses:
+        if other_panel.regions:
             ax.legend(loc="best", fontsize=8)
 
-    def ellipse_full_mask(self, panel, ellipse):
-        """Boolean mask, over the full catalog, of points inside `ellipse` and valid for `panel`."""
-        x0, y0 = ellipse["center"]
-        rx, ry = max(ellipse["rx"], 1e-12), max(ellipse["ry"], 1e-12)
-        inside = ((panel.x_all - x0) / rx) ** 2 + (
-            (panel.y_all - y0) / ry
-        ) ** 2 <= 1
+    @staticmethod
+    def make_patch(shape, center, rx, ry, color, linewidth):
+        """Unfilled matplotlib patch for a region of half-widths (rx, ry) about `center`."""
+        x0, y0 = center
+        if shape == "box":
+            return Rectangle(
+                (x0 - rx, y0 - ry),
+                2 * rx,
+                2 * ry,
+                fill=False,
+                edgecolor=color,
+                linewidth=linewidth,
+            )
+        return Ellipse(
+            center,
+            2 * rx,
+            2 * ry,
+            fill=False,
+            edgecolor=color,
+            linewidth=linewidth,
+        )
+
+    def region_full_mask(self, panel, region):
+        """Boolean mask, over the full catalog, of points inside `region` and valid for `panel`."""
+        x0, y0 = region["center"]
+        rx, ry = max(region["rx"], 1e-12), max(region["ry"], 1e-12)
+        if region["shape"] == "box":
+            inside = (np.abs(panel.x_all - x0) <= rx) & (
+                np.abs(panel.y_all - y0) <= ry
+            )
+        else:
+            inside = ((panel.x_all - x0) / rx) ** 2 + (
+                (panel.y_all - y0) / ry
+            ) ** 2 <= 1
         return inside & panel.mask
 
-    def count_in_ellipse(self, panel, ellipse):
-        return int(self.ellipse_full_mask(panel, ellipse).sum())
+    def count_in_region(self, panel, region):
+        return int(self.region_full_mask(panel, region).sum())
+
+    def redraw_sed(self):
+        ax = self.sed_ax
+        ax.clear()
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Wavelength [Å]")
+        ax.set_ylabel(f"Flux / Flux({SED_NORM_BAND})")
+
+        selected = self.selected_regions()
+        if not selected:
+            ax.set_title("SED (select a region)")
+            return
+        ax.set_title("SED of selected clusters")
+
+        for key, panel, region in selected:
+            mask = self.region_full_mask(panel, region) & self.sed_norm_valid
+            idx = np.flatnonzero(mask)
+            if idx.size == 0:
+                continue
+
+            # with several regions selected, the individual SEDs would bury
+            # each other, so only the medians are drawn
+            plot_idx = idx if len(selected) == 1 else []
+            if len(plot_idx) > SED_MAX_LINES:
+                rng = np.random.default_rng(0)
+                plot_idx = rng.choice(idx, size=SED_MAX_LINES, replace=False)
+            for i in plot_idx:
+                valid = [b for b in BAND_NAMES if self.sed_band_valid[b][i]]
+                if len(valid) >= 2:
+                    ax.plot(
+                        [FILTERS[b]["eff_wave"] for b in valid],
+                        [self.sed_flux_norm[b][i] for b in valid],
+                        color=region["color"],
+                        alpha=0.15,
+                        linewidth=0.8,
+                    )
+
+            avg_x, avg_y = [], []
+            for b in BAND_NAMES:
+                vals = self.sed_flux_norm[b][idx][self.sed_band_valid[b][idx]]
+                if vals.size > 0:
+                    avg_x.append(FILTERS[b]["eff_wave"])
+                    avg_y.append(np.median(vals))
+            ax.plot(
+                avg_x,
+                avg_y,
+                color=region["color"],
+                linewidth=2.5,
+                marker="o",
+                label=f"{key} median (N={idx.size})",
+            )
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc="best", fontsize=8)
+        else:
+            ax.set_title("SED (no selected cluster has valid F814W)")
 
     # ---- mouse interaction --------------------------------------------------
 
@@ -592,7 +747,7 @@ class App:
             return
         panel.press_xy = (event.xdata, event.ydata)
         panel.press_pixel = (event.x, event.y)
-        panel.drag_ellipse = None  # created lazily once drag exceeds threshold
+        panel.drag_region = None  # created lazily once drag exceeds threshold
 
     def on_motion(self, event):
         if self.mode.get() != "add":
@@ -607,27 +762,35 @@ class App:
             if (dx_px**2 + dy_px**2) ** 0.5 < DRAG_THRESHOLD_PX:
                 continue
             x0, y0 = panel.press_xy
-            rx = abs(event.xdata - x0)
-            ry = abs(event.ydata - y0)
-            if panel.drag_ellipse is None:
+            if panel.drag_region is None:
+                shape = self.shape.get()
                 color = next(panel.color_cycle)
-                patch = Ellipse(
-                    (x0, y0),
-                    2 * rx,
-                    2 * ry,
-                    fill=False,
-                    edgecolor=color,
-                    linewidth=1.4,
-                )
-                panel.ax.add_patch(patch)
-                panel.drag_ellipse = {
-                    "patch": patch,
-                    "color": color,
-                    "center": (x0, y0),
-                }
             else:
-                panel.drag_ellipse["patch"].set_width(2 * rx)
-                panel.drag_ellipse["patch"].set_height(2 * ry)
+                shape = panel.drag_region["shape"]
+                color = panel.drag_region["color"]
+                panel.drag_region["patch"].remove()
+            if shape == "box":
+                # press point is one corner, cursor is the opposite corner
+                center = ((x0 + event.xdata) / 2, (y0 + event.ydata) / 2)
+                rx = abs(event.xdata - x0) / 2
+                ry = abs(event.ydata - y0) / 2
+            else:
+                # press point is the center, cursor is on the edge
+                center = (x0, y0)
+                rx = abs(event.xdata - x0)
+                ry = abs(event.ydata - y0)
+            patch = self.make_patch(
+                shape, center, rx, ry, color, linewidth=1.4
+            )
+            panel.ax.add_patch(patch)
+            panel.drag_region = {
+                "patch": patch,
+                "shape": shape,
+                "color": color,
+                "center": center,
+                "rx": rx,
+                "ry": ry,
+            }
             self.canvas.draw_idle()
 
     def on_release(self, event):
@@ -635,108 +798,138 @@ class App:
         for key, panel in self.panels.items():
             if panel.press_xy is None:
                 continue
-            if mode == "add" and panel.drag_ellipse is not None:
-                center = panel.drag_ellipse["center"]
-                patch = panel.drag_ellipse["patch"]
-                rx, ry = patch.get_width() / 2, patch.get_height() / 2
-                color = panel.drag_ellipse["color"]
-                patch.remove()
-                panel.ellipses.append(
-                    {"center": center, "rx": rx, "ry": ry, "color": color}
-                )
-                panel.selected = None
-                self.redraw_panel(key, preserve_limits=True)
-                self.redraw_panel(self.other_key(key), preserve_limits=True)
-                self.canvas.draw_idle()
+            if mode == "add" and panel.drag_region is not None:
+                drag = panel.drag_region
+                drag["patch"].remove()
+                new_region = {
+                    k: drag[k] for k in ("shape", "center", "rx", "ry", "color")
+                }
+                panel.regions.append(new_region)
+                if not self.multi.get():
+                    self.clear_selection()
+                panel.selected.append(new_region)
+                self.refresh_regions()
             elif (
                 mode == "select"
                 and event.inaxes is panel.ax
                 and event.xdata is not None
             ):
-                self.handle_click_select(key, panel, event.xdata, event.ydata)
+                self.handle_click_select(panel, event.xdata, event.ydata)
             panel.press_xy = None
             panel.press_pixel = None
-            panel.drag_ellipse = None
+            panel.drag_region = None
 
-    def handle_click_select(self, key, panel, x, y):
+    def handle_click_select(self, panel, x, y):
         hit = None
-        for e in reversed(panel.ellipses):
+        for e in reversed(panel.regions):
             x0, y0 = e["center"]
             rx, ry = max(e["rx"], 1e-12), max(e["ry"], 1e-12)
-            if ((x - x0) / rx) ** 2 + ((y - y0) / ry) ** 2 <= 1:
+            if e["shape"] == "box":
+                inside = abs(x - x0) <= rx and abs(y - y0) <= ry
+            else:
+                inside = ((x - x0) / rx) ** 2 + ((y - y0) / ry) ** 2 <= 1
+            if inside:
                 hit = e
                 break
-        panel.selected = hit
-        self.redraw_panel(key, preserve_limits=True)
-        self.canvas.draw_idle()
-        self.status.set(
-            f"Selected ellipse: N={self.count_in_ellipse(panel, hit)}"
-            if hit
-            else ""
-        )
+        if self.multi.get():
+            if hit is None:
+                return
+            if self.is_selected(panel, hit):
+                panel.selected = [s for s in panel.selected if s is not hit]
+            else:
+                panel.selected.append(hit)
+        else:
+            self.clear_selection()
+            if hit is not None:
+                panel.selected.append(hit)
+        self.refresh_regions()
 
-    # ---- Ellipse toolbar --------------------------------------------------
+    # ---- Region toolbar ---------------------------------------------------
 
     def _update_mode_label(self):
         text = {
             "add": "Mode: Add new\ndrag on either panel to draw",
-            "select": "Mode: Select\nclick inside an ellipse to select it",
+            "select": "Mode: Select\nclick inside a region to select it",
         }.get(self.mode.get(), "")
         self.mode_label.set(text)
 
     def other_key(self, key):
         return "qq" if key == "ccd" else "ccd"
 
-    def find_selected(self):
-        """(key, panel) of whichever panel currently has a selected ellipse, or (None, None)."""
-        for key, panel in self.panels.items():
-            if panel.selected is not None:
-                return key, panel
-        return None, None
+    @staticmethod
+    def is_selected(panel, region):
+        return any(region is s for s in panel.selected)
+
+    def selected_regions(self):
+        """[(key, panel, region), ...] for every selected region on either panel."""
+        return [
+            (key, panel, region)
+            for key, panel in self.panels.items()
+            for region in panel.selected
+        ]
+
+    def clear_selection(self):
+        for panel in self.panels.values():
+            panel.selected = []
+
+    def refresh_regions(self):
+        """Redraw both panels + SED after any change to regions or selection."""
+        for key in self.panels:
+            self.redraw_panel(key, preserve_limits=True)
+        self.redraw_sed()
+        self.canvas.draw_idle()
+        selected = self.selected_regions()
+        if len(selected) == 1:
+            key, panel, region = selected[0]
+            self.status.set(
+                f"Selected region: N={self.count_in_region(panel, region)}"
+            )
+        elif selected:
+            self.status.set(f"Selected {len(selected)} regions")
+        else:
+            self.status.set("")
 
     def delete_selected(self):
-        key, panel = self.find_selected()
-        if panel is None:
-            self.status.set("No ellipse selected")
+        selected = self.selected_regions()
+        if not selected:
+            self.status.set("No region selected")
             return
-        panel.ellipses.remove(panel.selected)
-        panel.selected = None
-        self.redraw_panel(key, preserve_limits=True)
-        self.redraw_panel(self.other_key(key), preserve_limits=True)
-        self.canvas.draw_idle()
-        self.status.set("")
+        for _, panel, region in selected:
+            panel.regions = [r for r in panel.regions if r is not region]
+        self.clear_selection()
+        self.refresh_regions()
+
+    def delete_all(self):
+        for panel in self.panels.values():
+            panel.regions = []
+        self.clear_selection()
+        self.refresh_regions()
 
     def unfocus_selected(self):
-        key, panel = self.find_selected()
-        if panel is not None:
-            panel.selected = None
-            self.redraw_panel(key, preserve_limits=True)
-            self.canvas.draw_idle()
-        self.status.set("")
+        self.clear_selection()
+        self.refresh_regions()
 
     def move_selected(self, dx_sign, dy_sign):
-        key, panel = self.find_selected()
-        if panel is None:
+        selected = self.selected_regions()
+        if not selected:
             return
-        xlim, ylim = panel.ax.get_xlim(), panel.ax.get_ylim()
-        step_x = MOVE_STEP_FRAC * (xlim[1] - xlim[0]) * dx_sign
-        step_y = MOVE_STEP_FRAC * (ylim[1] - ylim[0]) * dy_sign
-        x0, y0 = panel.selected["center"]
-        panel.selected["center"] = (x0 + step_x, y0 + step_y)
-        self.redraw_panel(key, preserve_limits=True)
-        self.redraw_panel(self.other_key(key), preserve_limits=True)
-        self.canvas.draw_idle()
+        for _, panel, region in selected:
+            xlim, ylim = panel.ax.get_xlim(), panel.ax.get_ylim()
+            step_x = MOVE_STEP_FRAC * (xlim[1] - xlim[0]) * dx_sign
+            step_y = MOVE_STEP_FRAC * (ylim[1] - ylim[0]) * dy_sign
+            x0, y0 = region["center"]
+            region["center"] = (x0 + step_x, y0 + step_y)
+        self.refresh_regions()
 
     def resize_selected(self, fx=1.0, fy=1.0):
-        key, panel = self.find_selected()
-        if panel is None:
-            self.status.set("No ellipse selected")
+        selected = self.selected_regions()
+        if not selected:
+            self.status.set("No region selected")
             return
-        panel.selected["rx"] *= fx
-        panel.selected["ry"] *= fy
-        self.redraw_panel(key, preserve_limits=True)
-        self.redraw_panel(self.other_key(key), preserve_limits=True)
-        self.canvas.draw_idle()
+        for _, _, region in selected:
+            region["rx"] *= fx
+            region["ry"] *= fy
+        self.refresh_regions()
 
     def on_delete_key(self, event):
         self.delete_selected()
