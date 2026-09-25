@@ -7,7 +7,12 @@ different scales, so a fixed-radius circle would look distorted relative to
 the data.
 
 Left panel (CCD): a plain 2-filter color-color diagram, x = mag[X1]-mag[X2],
-y = mag[Y1]-mag[Y2] - pick any 4 filters from the dropdowns.
+y = mag[Y1]-mag[Y2] - pick any 4 filters from the dropdowns. An optional
+Rayleigh-Jeans limit marker shows the color(s) a pure RJ spectrum
+(F_nu ~ nu^2, temperature-independent) would have for the filters
+currently on each axis - a crosshair at (x, y) in color-color mode, or a
+vertical line at x in CMD mode (Y is a magnitude, not a color, so has no
+RJ value of its own).
 
 Right panel (Q-Q): the reddening-free index used throughout the other
 scripts in this folder, Q = (f1-f2) - k*(f2-f3) with
@@ -50,11 +55,12 @@ median is drawn (in that region's color), so the curves stay readable.
 Updates whenever the selection, a region, or the filter dropdowns change.
 """
 
+import csv
 import glob
 import itertools
 import os
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 import extinction
 import matplotlib
@@ -62,6 +68,7 @@ import numpy as np
 import pandas as pd
 from astropy.io import fits
 from scipy.ndimage import gaussian_filter
+from scipy.signal import find_peaks
 
 from matplotlib.backends.backend_tkagg import (
     FigureCanvasTkAgg,
@@ -72,6 +79,11 @@ from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from matplotlib.patches import Ellipse, Rectangle
 
+try:
+    import settings
+except ImportError:
+    from . import settings
+
 # Matplotlib's default keyboard shortcuts (arrow keys pan, Backspace goes
 # back, etc.) collide with this app's own arrow-key/Delete bindings for
 # moving and deleting regions, so turn them all off.
@@ -79,14 +91,9 @@ for _keymap in list(matplotlib.rcParams):
     if _keymap.startswith("keymap."):
         matplotlib.rcParams[_keymap] = []
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_CMAP = "viridis"
 MODEL_LINESTYLES = ["-", ":", "-.", ":"]
 MODEL_LINEWIDTHS = {"-": 3.0, "--": 2.0, "-.": 2.0, ":": 2.0}
-CATALOG_GLOB = (
-    "/home/igerasimov/Nextcloud/science/phangs/DATA/PHANGSGALAXIES/"
-    "hstjwstfilters/Phot_v5p3_*_IR4_class12human.csv"
-)
 SN_MIN = 3.0
 R_V = 3.1
 
@@ -228,6 +235,33 @@ def discover_model_sets(project_dir):
     return sets
 
 
+SLUG_TRACK_LABEL = "slug"
+SLUG_TRACK_CACHE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    os.pardir,
+    "modified_models",
+    "slug_deterministic_track.npz",
+)
+
+
+def load_slug_track(path):
+    """{system: {band: array}} magnitudes plus ages [Myr] for the slug3
+    deterministic SSP track, from the cache written by
+    modified_models/precompute_slug_track.py (slugpy itself isn't a
+    dependency here - see that script's docstring for why)."""
+    with np.load(path) as data:
+        ages = data["ages"]
+        mags = {
+            system: {
+                b: data[f"{system}_{b}"]
+                for b in BAND_NAMES
+                if f"{system}_{b}" in data
+            }
+            for system in MAG_SYSTEMS
+        }
+    return mags, ages
+
+
 def resolve_filter(df, options):
     """First of `options` (HST/JWST filter codes) present as a *_ab/*_veg column in df."""
     for opt in options:
@@ -236,9 +270,21 @@ def resolve_filter(df, options):
     return None
 
 
+def galaxy_name_from_path(path):
+    """Galaxy name from a Phot_v5p3_<galaxy>_IR4_class12human.csv catalog filename."""
+    base = os.path.basename(path)
+    prefix, suffix = "Phot_v5p3_", "_IR4_class12human.csv"
+    if base.startswith(prefix) and base.endswith(suffix):
+        return base[len(prefix) : -len(suffix)]
+    return base
+
+
 def load_catalog(catalog_glob):
-    """Observed magnitudes (both AB and Vega) + S/N for class 1+2 clusters, all galaxies combined."""
+    """Observed magnitudes (both AB and Vega) + S/N for class 1+2 clusters,
+    all galaxies combined, plus the untouched original catalog rows (tagged
+    with a "galaxy" column) in the same row order, for subcatalog export."""
     frames = []
+    full_frames = []
     for path in sorted(glob.glob(catalog_glob)):
         df = pd.read_csv(path)
         frame = {}
@@ -255,6 +301,9 @@ def load_catalog(catalog_glob):
                     f"signal_to_noise_original_{hst_filter}"
                 ]
         frames.append(pd.DataFrame(frame))
+        full = df.copy()
+        full.insert(0, "galaxy", galaxy_name_from_path(path))
+        full_frames.append(full)
 
     cat = pd.concat(frames, ignore_index=True)
     mag = {
@@ -262,7 +311,8 @@ def load_catalog(catalog_glob):
         for system in MAG_SYSTEMS
     }
     sn = {b: cat[f"{b}_sn"].to_numpy() for b in BAND_NAMES}
-    return mag, sn
+    full_cat = pd.concat(full_frames, ignore_index=True)
+    return mag, sn, full_cat
 
 
 def good_mask(mag, sn, bands):
@@ -288,6 +338,50 @@ def kde_density(x, y, grid_size=KDE_GRID_SIZE, smooth_sigma=KDE_SMOOTH_SIGMA):
     x_centers = (xedges[:-1] + xedges[1:]) / 2
     y_centers = (yedges[:-1] + yedges[1:]) / 2
     return x_centers, y_centers, density
+
+
+def _closest_local_max_index(profile, prev_index):
+    """Index of the local maximum in `profile` nearest to `prev_index` -
+    falls back to the profile's global argmax if it has no interior peak."""
+    peaks, _ = find_peaks(profile)
+    if peaks.size == 0:
+        return int(np.argmax(profile))
+    return int(peaks[np.argmin(np.abs(peaks - prev_index))])
+
+
+def density_ridge(x, y, grid_size=KDE_GRID_SIZE, smooth_sigma=KDE_SMOOTH_SIGMA):
+    """(x, y) of the density ridge: starting from the single densest grid
+    row and moving outward, the x where each y-row's density peaks closest
+    to the previous row's - so a color space with two branches (e.g. two
+    cluster populations) doesn't make the ridge jump between them whenever
+    their relative heights flip. Rows whose raw (unsmoothed) point count is
+    below KDE_MIN_LEVEL_FRAC of the fullest row's are dropped from the
+    result - smoothing can make a handful of stray points in an otherwise
+    near-empty row look like a locally significant peak, which a threshold
+    on the smoothed density itself would miss."""
+    finite = np.isfinite(x) & np.isfinite(y)
+    raw_hist, _, _ = np.histogram2d(x[finite], y[finite], bins=grid_size)
+    row_count = raw_hist.sum(axis=0)
+    if row_count.max() <= 0:
+        return np.array([]), np.array([])
+    valid = row_count >= KDE_MIN_LEVEL_FRAC * row_count.max()
+
+    x_centers, y_centers, density = kde_density(x, y, grid_size, smooth_sigma)
+    row_peak = density.max(axis=1)
+    n_rows = density.shape[0]
+    ridge_col = np.empty(n_rows, dtype=int)
+    start = int(np.argmax(row_peak))
+    ridge_col[start] = int(np.argmax(density[start, :]))
+    for row in range(start - 1, -1, -1):
+        ridge_col[row] = _closest_local_max_index(
+            density[row, :], ridge_col[row + 1]
+        )
+    for row in range(start + 1, n_rows):
+        ridge_col[row] = _closest_local_max_index(
+            density[row, :], ridge_col[row - 1]
+        )
+
+    return x_centers[ridge_col[valid]], y_centers[valid]
 
 
 class Panel:
@@ -316,15 +410,21 @@ class App:
         self.root = root
         root.title("CCD / Q-Q explorer")
 
-        self.model_dirs = discover_model_sets(PROJECT_DIR)
-        self.model_labels = sorted(self.model_dirs)
+        self.model_dirs = discover_model_sets(settings.PROJECT_DIR)
+        self.model_sets = {}
+        for label, model_dir in self.model_dirs.items():
+            mags, age = load_models(model_dir)
+            self.model_sets[label] = {"mag": mags, "log_age": np.log10(age)}
+        if os.path.exists(SLUG_TRACK_CACHE):
+            mags, age = load_slug_track(SLUG_TRACK_CACHE)
+            self.model_sets[SLUG_TRACK_LABEL] = {
+                "mag": mags,
+                "log_age": np.log10(age),
+            }
+        self.model_labels = sorted(self.model_sets)
         self.model_linestyles = dict(
             zip(self.model_labels, itertools.cycle(MODEL_LINESTYLES))
         )
-        self.model_sets = {}
-        for label in self.model_labels:
-            mags, age = load_models(self.model_dirs[label])
-            self.model_sets[label] = {"mag": mags, "log_age": np.log10(age)}
         all_log_age = (
             np.concatenate([s["log_age"] for s in self.model_sets.values()])
             if self.model_sets
@@ -338,7 +438,9 @@ class App:
             label: tk.BooleanVar(value=True) for label in self.model_labels
         }
         self.mag_system = tk.StringVar(value="ab")
-        self.cat_mag, self.cat_sn = load_catalog(CATALOG_GLOB)
+        self.cat_mag, self.cat_sn, self.full_catalog = load_catalog(
+            settings.CATALOG_GLOB
+        )
         self._prepare_sed_arrays()
 
         self.fig = Figure(figsize=(12, 8.5))
@@ -419,6 +521,14 @@ class App:
             command=self.redraw_all,
         ).grid(row=next(row), column=0, columnspan=2, sticky="w")
 
+        self.ccd_show_rj = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="Rayleigh-Jeans limit",
+            variable=self.ccd_show_rj,
+            command=self.redraw_all,
+        ).grid(row=next(row), column=0, columnspan=2, sticky="w")
+
         ttk.Separator(frame, orient="horizontal").grid(
             row=next(row), column=0, columnspan=2, sticky="ew", pady=8
         )
@@ -466,6 +576,20 @@ class App:
             text="KDE density (instead of scatter)",
             variable=self.kde_background,
             command=self.redraw_all,
+        ).grid(row=next(row), column=0, columnspan=2, sticky="w")
+
+        self.show_ridge = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="Density ridge line",
+            variable=self.show_ridge,
+            command=self.redraw_all,
+        ).grid(row=next(row), column=0, columnspan=2, sticky="w")
+
+        ttk.Button(
+            frame,
+            text="Export ridge line...",
+            command=self.export_ridge,
         ).grid(row=next(row), column=0, columnspan=2, sticky="w")
 
         ttk.Separator(frame, orient="horizontal").grid(
@@ -586,6 +710,12 @@ class App:
             width=9,
             command=self.delete_all,
         ).grid(row=4, column=0, padx=1, pady=1)
+
+        ttk.Button(
+            frame,
+            text="Export subcatalog...",
+            command=self.export_subcatalog,
+        ).grid(row=next(row), column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         self.mode_label = tk.StringVar()
         ttk.Label(
@@ -730,6 +860,17 @@ class App:
         panel.y = panel.y_all[panel.mask]
         panel.title = f"{'Mag-Q' if cmd else 'Q-Q'} (N={panel.mask.sum()})"
 
+    def rj_color(self, b1, b2):
+        """mag[b1]-mag[b2] a pure Rayleigh-Jeans spectrum (F_nu ~ nu^2,
+        i.e. temperature-independent) would have, in the current magnitude
+        system."""
+        lam1, lam2 = FILTERS[b1]["eff_wave"], FILTERS[b2]["eff_wave"]
+        if self.mag_system.get() == "veg":
+            zp1, zp2 = FILTERS[b1]["zp_vega"], FILTERS[b2]["zp_vega"]
+        else:
+            zp1 = zp2 = AB_ZP_JY
+        return -2.5 * np.log10((lam1**-2 / zp1) / (lam2**-2 / zp2))
+
     def redraw_all(self):
         try:
             self.compute_ccd()
@@ -767,6 +908,16 @@ class App:
             ax.scatter(
                 panel.x, panel.y, s=3, c="gray", alpha=0.3, rasterized=True
             )
+        if self.show_ridge.get() and panel.x.size >= KDE_MIN_POINTS:
+            ridge_x, ridge_y = density_ridge(panel.x, panel.y)
+            if ridge_x.size > 0:
+                ax.plot(
+                    ridge_x,
+                    ridge_y,
+                    color="red",
+                    linewidth=2,
+                    label="density ridge",
+                )
         cmd = self.ccd_cmd.get() if key == "ccd" else self.qq_cmd.get()
         if cmd or key == "qq":
             # model magnitudes aren't scaled to a real cluster mass/distance,
@@ -810,6 +961,34 @@ class App:
                     )
                 else:
                     panel.colorbar_obj.ax.set_visible(True)
+        if key == "ccd" and self.ccd_show_rj.get():
+            x_rj = self.rj_color(self.ccd_x1.get(), self.ccd_x2.get())
+            if cmd:
+                ax.axvline(
+                    x_rj,
+                    color="black",
+                    linestyle="--",
+                    linewidth=1.2,
+                    label="Rayleigh-Jeans limit",
+                )
+            else:
+                y_rj = self.rj_color(self.ccd_y1.get(), self.ccd_y2.get())
+                ax.axvline(
+                    x_rj, color="black", linestyle="--", linewidth=0.8, alpha=0.6
+                )
+                ax.axhline(
+                    y_rj, color="black", linestyle="--", linewidth=0.8, alpha=0.6
+                )
+                ax.plot(
+                    x_rj,
+                    y_rj,
+                    marker="+",
+                    color="black",
+                    markersize=12,
+                    markeredgewidth=2,
+                    linestyle="none",
+                    label="Rayleigh-Jeans limit",
+                )
         ax.set_xlabel(panel.xlabel)
         ax.set_ylabel(panel.ylabel)
         ax.set_title(panel.title)
@@ -949,6 +1128,61 @@ class App:
             ax.legend(loc="best", fontsize=8)
         else:
             ax.set_title("SED (no selected cluster has valid F814W)")
+
+    def export_ridge(self):
+        """Save the current density ridge line(s) (see density_ridge()) to a
+        CSV chosen via a save dialog - one row per (panel, x, y) point,
+        covering whichever panel(s) currently have enough points for a
+        ridge, regardless of whether "Density ridge line" is checked."""
+        rows = []
+        for key, panel in self.panels.items():
+            if panel.x.size < KDE_MIN_POINTS:
+                continue
+            ridge_x, ridge_y = density_ridge(panel.x, panel.y)
+            for xv, yv in zip(ridge_x, ridge_y):
+                rows.append((key, panel.xlabel, panel.ylabel, xv, yv))
+        if not rows:
+            self.status.set("No ridge line to export (not enough points)")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            title="Save density ridge line",
+        )
+        if not path:
+            return
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["panel", "xlabel", "ylabel", "x", "y"])
+            writer.writerows(rows)
+        self.status.set(f"Ridge line saved to {os.path.basename(path)}")
+
+    def export_subcatalog(self):
+        """Save the original catalog rows for every cluster inside the
+        selected box region, to a CSV chosen via a save dialog. Requires
+        exactly one selected region, and it must be a box (not an ellipse)."""
+        selected = self.selected_regions()
+        if len(selected) != 1 or selected[0][2]["shape"] != "box":
+            self.status.set(
+                "Select exactly one box region to export a subcatalog"
+            )
+            return
+        _, panel, region = selected[0]
+        mask = self.region_full_mask(panel, region)
+        if mask.sum() == 0:
+            self.status.set("No clusters in the selected box")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            title="Save subcatalog",
+        )
+        if not path:
+            return
+        self.full_catalog.loc[mask].to_csv(path, index=False)
+        self.status.set(
+            f"Subcatalog saved to {os.path.basename(path)} (N={int(mask.sum())})"
+        )
 
     # ---- mouse interaction --------------------------------------------------
 
